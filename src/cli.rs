@@ -33,6 +33,23 @@ use crate::{
 
 const PROGRESS_BAR_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Extract game install directories from launcher information
+pub fn extract_game_install_dirs(launchers: &Launchers, roots: &[crate::resource::config::Root], game_name: &str) -> Vec<StrictPath> {
+    let mut install_dirs = Vec::new();
+    
+    for root in roots {
+        for launcher_game in launchers.get_game(root, game_name) {
+            if let Some(install_dir) = &launcher_game.install_dir {
+                if !install_dirs.contains(install_dir) {
+                    install_dirs.push(install_dir.clone());
+                }
+            }
+        }
+    }
+    
+    install_dirs
+}
+
 pub fn show_error(games: &[String], error: &Error, gui: bool, force: bool) {
     let message = TRANSLATOR.handle_error(error);
 
@@ -53,7 +70,7 @@ fn negatable_flag(on: bool, off: bool, default: bool) -> bool {
     }
 }
 
-fn load_manifest(
+pub fn load_manifest(
     config: &Config,
     cache: &mut Cache,
     no_manifest_update: bool,
@@ -294,6 +311,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     log::trace!("step {i} / {}: {name}", games.len());
                     let game = &manifest.0[name];
 
+                    let game_install_dirs = extract_game_install_dirs(&launchers, &roots, name);
                     let previous = layout.latest_backup(
                         name,
                         ScanKind::Backup,
@@ -301,6 +319,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                         config.restore.reverse_redirects,
                         &config.restore.toggled_paths,
                         config.backup.only_constructive,
+                        &game_install_dirs,
                     );
 
                     if filter.excludes(games_specified, previous.is_some(), &game.cloud) {
@@ -352,6 +371,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                             &backup_format,
                             retention,
                             config.backup.only_constructive,
+                            &extract_game_install_dirs(&launchers, &roots, name),
                         )
                     };
                     log::trace!("step {i} completed");
@@ -469,6 +489,8 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
 
             let manifest = load_manifest(&config, &mut cache, true, false).unwrap_or_default();
             let title_finder = TitleFinder::new(&config, &manifest, layout.restorable_game_set());
+            let roots = config.expanded_roots();
+            let launchers = Launchers::scan(&roots, &manifest, &games, &title_finder, None);
 
             let games_specified = !games.is_empty();
             let games = match evaluate_games(layout.restorable_game_set(), games, &title_finder) {
@@ -547,6 +569,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                         config.restore.reverse_redirects,
                         &config.restore.toggled_paths,
                         &config.restore.toggled_registry,
+                        &extract_game_install_dirs(&launchers, &roots, name),
                     );
                     let ignored = !&config.is_game_enabled_for_restore(name) && !games_specified && !include_disabled;
                     let decision = if ignored {

@@ -79,6 +79,7 @@ pub enum RestorePhase {
     RegisterCommands {
         restorables: Vec<String>,
         layout: BackupLayout,
+        launchers: crate::scan::launchers::Launchers,
     },
     GameScanned {
         scan_info: Option<ScanInfo>,

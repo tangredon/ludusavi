@@ -6,7 +6,7 @@ use std::{
 use chrono::{Datelike, Timelike};
 
 use crate::{
-    path::StrictPath,
+    path::{PathCategory, StrictPath},
     prelude::{AnyError, Error, INVALID_FILE_CHARS},
     resource::{
         config::{
@@ -336,7 +336,11 @@ pub struct IndividualMappingRegistry {
 #[serde(default, rename_all = "camelCase")]
 pub struct IndividualMapping {
     pub name: String,
+    /// Legacy drive mappings (for backward compatibility)
     pub drives: BTreeMap<String, String>,
+    /// Path category mappings for backups
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_mappings: Option<BTreeMap<String, String>>,
     pub backups: VecDeque<FullBackup>,
 }
 
@@ -361,19 +365,8 @@ impl IndividualMapping {
         }
     }
 
-    pub fn drive_folder_name(&mut self, drive: &str) -> String {
-        let reversed = self.reversed_drives();
-        match reversed.get::<str>(drive) {
-            Some(mapped) => mapped.to_string(),
-            None => {
-                let key = Self::new_drive_folder_name(drive);
-                self.drives.insert(key.to_string(), drive.to_string());
-                key
-            }
-        }
-    }
 
-    pub fn drive_folder_name_immutable(&self, drive: &str) -> String {
+    pub fn drive_folder_name(&self, drive: &str) -> String {
         let reversed = self.reversed_drives();
         match reversed.get::<str>(drive) {
             Some(mapped) => mapped.to_string(),
@@ -381,28 +374,146 @@ impl IndividualMapping {
         }
     }
 
-    pub fn game_file(&mut self, base: &StrictPath, original_file: &StrictPath, backup: &str) -> StrictPath {
+
+    pub fn game_file(&self, base: &StrictPath, original_file: &StrictPath, backup: &str) -> StrictPath {
         let (drive, plain_path) = original_file.split_drive();
         let drive_folder = self.drive_folder_name(&drive);
         StrictPath::relative(format!("{backup}/{drive_folder}/{plain_path}"), base.interpret().ok())
     }
 
-    pub fn game_file_immutable(&self, base: &StrictPath, original_file: &StrictPath, backup: &str) -> StrictPath {
-        let (drive, plain_path) = original_file.split_drive();
-        let drive_folder = self.drive_folder_name_immutable(&drive);
-        StrictPath::relative(format!("{backup}/{drive_folder}/{plain_path}"), base.interpret().ok())
-    }
 
-    fn game_file_for_zip(&mut self, original_file: &StrictPath) -> String {
+    fn game_file_for_zip(&self, original_file: &StrictPath) -> String {
         let (drive, plain_path) = original_file.split_drive();
         let drive_folder = self.drive_folder_name(&drive);
         format!("{drive_folder}/{plain_path}").replace('\\', "/")
     }
 
-    fn game_file_for_zip_immutable(&self, original_file: &StrictPath) -> String {
-        let (drive, plain_path) = original_file.split_drive();
-        let drive_folder = self.drive_folder_name_immutable(&drive);
-        format!("{drive_folder}/{plain_path}").replace('\\', "/")
+    /// Path category-based methods for backup structure
+    
+    /// Initialize path mappings for new backup structure
+    pub fn ensure_path_mappings(&mut self) {
+        if self.path_mappings.is_none() {
+            let mut mappings = BTreeMap::new();
+            mappings.insert("system-user".to_string(), "%USERPROFILE%".to_string());
+            mappings.insert("system-appdata".to_string(), "%APPDATA%".to_string());
+            mappings.insert("system-localappdata".to_string(), "%LOCALAPPDATA%".to_string());
+            mappings.insert("system-localappdatalow".to_string(), "%LOCALAPPDATA%".to_string());
+            mappings.insert("game-relative".to_string(), "<GAME_ROOT>".to_string());
+            self.path_mappings = Some(mappings);
+        }
+    }
+    
+    /// Get backup file path using new path category system
+    pub fn game_file_with_category(
+        &mut self,
+        base: &StrictPath,
+        original_file: &StrictPath,
+        backup: &str,
+        game_install_dirs: &[StrictPath],
+    ) -> StrictPath {
+        self.ensure_path_mappings();
+        let (category, relative_path) = original_file.classify_and_split(game_install_dirs);
+        
+        
+        let category_folder = category.folder_name();
+        StrictPath::relative(
+            format!("{backup}/{category_folder}/{relative_path}"),
+            base.interpret().ok(),
+        )
+    }
+    
+    /// Get backup file path for ZIP using new path category system
+    pub fn game_file_for_zip_with_category(
+        &mut self,
+        original_file: &StrictPath,
+        game_install_dirs: &[StrictPath],
+    ) -> String {
+        self.ensure_path_mappings();
+        let (category, relative_path) = original_file.classify_and_split(game_install_dirs);
+        
+        
+        let category_folder = category.folder_name();
+        format!("{category_folder}/{relative_path}").replace('\\', "/")
+    }
+    
+    /// Reconstruct original path from category-based backup path
+    pub fn reconstruct_original_path(
+        &self,
+        category_folder: &str,
+        relative_path: &str,
+        game_install_dirs: &[StrictPath],
+    ) -> Option<StrictPath> {
+        let category = match category_folder {
+            "system-user" => PathCategory::SystemUser,
+            "system-appdata" => PathCategory::SystemAppData,
+            "system-localappdata" => PathCategory::SystemLocalAppData,
+            "system-localappdatalow" => PathCategory::SystemLocalAppDataLow,
+            "game-relative" => PathCategory::GameRelative,
+            _ => return None,
+        };
+        
+        match category {
+            PathCategory::SystemUser => {
+                if let Some(userprofile) = crate::path::CommonPath::Home.get() {
+                    let normalized_base = userprofile.replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    return Some(StrictPath::new(format!("{}/{}", normalized_base, normalized_relative)).rendered());
+                }
+            },
+            PathCategory::SystemAppData => {
+                if let Some(appdata) = crate::path::CommonPath::Data.get() {
+                    let normalized_base = appdata.replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    return Some(StrictPath::new(format!("{}/{}", normalized_base, normalized_relative)).rendered());
+                }
+            },
+            PathCategory::SystemLocalAppData => {
+                if let Some(localappdata) = crate::path::CommonPath::DataLocal.get() {
+                    let normalized_base = localappdata.replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    return Some(StrictPath::new(format!("{}/{}", normalized_base, normalized_relative)).rendered());
+                }
+            },
+            PathCategory::SystemLocalAppDataLow => {
+                if let Some(localappdata_low) = crate::path::CommonPath::DataLocalLow.get() {
+                    let normalized_base = localappdata_low.replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    return Some(StrictPath::new(format!("{}/{}", normalized_base, normalized_relative)).rendered());
+                }
+            },
+            PathCategory::GameRelative => {
+                // For game-relative paths, try to find the best matching game directory
+                // First try to find a directory that contains this relative path
+                for game_dir in game_install_dirs {
+                    let normalized_base = game_dir.raw().replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    let potential_path = StrictPath::new(format!("{}/{}", normalized_base, normalized_relative));
+                    
+                    // Check if this potential path exists
+                    if potential_path.exists() {
+                        // Use rendered() to ensure consistent path format
+                        let rendered_path = potential_path.rendered();
+                        log::trace!("Reconstructed game-relative path: {} -> {}", relative_path, rendered_path.raw());
+                        return Some(rendered_path);
+                    }
+                }
+                
+                // If no exact match found, use the first game directory as fallback
+                if let Some(game_dir) = game_install_dirs.first() {
+                    let normalized_base = game_dir.raw().replace('\\', "/");
+                    let normalized_relative = relative_path.replace('\\', "/");
+                    let reconstructed = StrictPath::new(format!("{}/{}", normalized_base, normalized_relative));
+                    // Use rendered() to ensure consistent path format
+                    let rendered_path = reconstructed.rendered();
+                    log::trace!("Reconstructed game-relative path (fallback): {} -> {}", relative_path, rendered_path.raw());
+                    return Some(rendered_path);
+                }
+                
+                log::warn!("Failed to reconstruct game-relative path: {} (no game dirs provided)", relative_path);
+            },
+        }
+        
+        None
     }
 
     fn latest_backup(&self) -> Option<(&FullBackup, Option<&DifferentialBackup>)> {
@@ -610,6 +721,7 @@ impl GameLayout {
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
         only_constructive_backups: bool,
+        game_install_dirs: &[StrictPath],
     ) -> Option<ScanInfo> {
         if self.mapping.backups.is_empty() {
             None
@@ -622,6 +734,7 @@ impl GameLayout {
                     redirects,
                     reverse_redirects_on_restore,
                     toggled_paths,
+                    game_install_dirs,
                 ),
                 // Registry is handled separately.
                 found_registry_keys: Default::default(),
@@ -655,6 +768,7 @@ impl GameLayout {
         redirects: &[RedirectConfig],
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
+        game_install_dirs: &[StrictPath],
     ) -> HashMap<StrictPath, ScannedFile> {
         let mut files = HashMap::new();
 
@@ -667,6 +781,7 @@ impl GameLayout {
                     redirects,
                     reverse_redirects_on_restore,
                     toggled_paths,
+                    game_install_dirs,
                 ));
             }
             Some((full, Some(diff))) => {
@@ -676,6 +791,7 @@ impl GameLayout {
                     redirects,
                     reverse_redirects_on_restore,
                     toggled_paths,
+                    game_install_dirs,
                 ));
 
                 for (scan_key, full_file) in self.restorable_files_from_full_backup(
@@ -684,6 +800,7 @@ impl GameLayout {
                     redirects,
                     reverse_redirects_on_restore,
                     toggled_paths,
+                    game_install_dirs,
                 ) {
                     let original_path = full_file.original_path.as_ref().unwrap().render();
                     if diff.file(original_path) == BackupInclusion::Inherited {
@@ -703,11 +820,26 @@ impl GameLayout {
         redirects: &[RedirectConfig],
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
+        game_install_dirs: &[StrictPath],
     ) -> HashMap<StrictPath, ScannedFile> {
         let mut restorables = HashMap::new();
 
         for (mapping_key, v) in &backup.files {
-            let original_path = StrictPath::new(mapping_key.to_string());
+            let original_path = if let Some(slash_pos) = mapping_key.find('/') {
+                let category_folder = &mapping_key[..slash_pos];
+                let relative_path = &mapping_key[slash_pos + 1..];
+                
+                // Reconstruct the original Windows path from backup path
+                if let Some(reconstructed) = self.mapping.reconstruct_original_path(category_folder, relative_path, game_install_dirs) {
+                    reconstructed
+                } else {
+                    // Fallback to treating as original path if reconstruction fails
+                    StrictPath::new(mapping_key.to_string())
+                }
+            } else {
+                // No slash found, treat as original path
+                StrictPath::new(mapping_key.to_string())
+            };
             let redirected = game_file_target(
                 &original_path,
                 redirects,
@@ -717,12 +849,17 @@ impl GameLayout {
             let ignorable_path = redirected.as_ref().unwrap_or(&original_path);
             match backup.format() {
                 BackupFormat::Simple => {
-                    let scan_key = self
-                        .mapping
-                        .game_file_immutable(&self.path, &original_path, &backup.name);
+                    let scan_key = StrictPath::relative(
+                        format!("{}/{}", &backup.name, mapping_key),
+                        self.path.interpret().ok(),
+                    );
 
+                    let key = match scan_kind {
+                        ScanKind::Backup => original_path.clone(),
+                        ScanKind::Restore => scan_key,
+                    };
                     restorables.insert(
-                        scan_key,
+                        key,
                         ScannedFile {
                             change: match scan_kind {
                                 ScanKind::Backup => ScanChange::Unknown,
@@ -734,16 +871,20 @@ impl GameLayout {
                             hash: v.hash.clone(),
                             ignored: toggled_paths.is_ignored(&self.mapping.name, ignorable_path),
                             redirected,
-                            original_path: Some(original_path),
+                            original_path: Some(original_path.clone()),
                             container: None,
                         },
                     );
                 }
                 BackupFormat::Zip => {
-                    let scan_key = StrictPath::new(self.mapping.game_file_for_zip_immutable(&original_path));
+                    let scan_key = StrictPath::new(mapping_key.replace('\\', "/"));
 
+                    let key = match scan_kind {
+                        ScanKind::Backup => original_path.clone(),
+                        ScanKind::Restore => scan_key,
+                    };
                     restorables.insert(
-                        scan_key,
+                        key,
                         ScannedFile {
                             change: match scan_kind {
                                 ScanKind::Backup => ScanChange::Unknown,
@@ -755,7 +896,7 @@ impl GameLayout {
                             hash: v.hash.clone(),
                             ignored: toggled_paths.is_ignored(&self.mapping.name, ignorable_path),
                             redirected,
-                            original_path: Some(original_path),
+                            original_path: Some(original_path.clone()),
                             container: Some(self.path.joined(&backup.name)),
                         },
                     );
@@ -773,12 +914,27 @@ impl GameLayout {
         redirects: &[RedirectConfig],
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
+        game_install_dirs: &[StrictPath],
     ) -> HashMap<StrictPath, ScannedFile> {
         let mut restorables = HashMap::new();
 
         for (mapping_key, v) in &backup.files {
             let v = some_or_continue!(v);
-            let original_path = StrictPath::new(mapping_key.to_string());
+            let original_path = if let Some(slash_pos) = mapping_key.find('/') {
+                let category_folder = &mapping_key[..slash_pos];
+                let relative_path = &mapping_key[slash_pos + 1..];
+                
+                // Reconstruct the original Windows path from backup path
+                if let Some(reconstructed) = self.mapping.reconstruct_original_path(category_folder, relative_path, game_install_dirs) {
+                    reconstructed
+                } else {
+                    // Fallback to treating as original path if reconstruction fails
+                    StrictPath::new(mapping_key.to_string())
+                }
+            } else {
+                // No slash found, treat as original path
+                StrictPath::new(mapping_key.to_string())
+            };
             let redirected = game_file_target(
                 &original_path,
                 redirects,
@@ -788,12 +944,17 @@ impl GameLayout {
             let ignorable_path = redirected.as_ref().unwrap_or(&original_path);
             match backup.format() {
                 BackupFormat::Simple => {
-                    let scan_key = self
-                        .mapping
-                        .game_file_immutable(&self.path, &original_path, &backup.name);
+                    let scan_key = StrictPath::relative(
+                        format!("{}/{}", &backup.name, mapping_key),
+                        self.path.interpret().ok(),
+                    );
 
+                    let key = match scan_kind {
+                        ScanKind::Backup => original_path.clone(),
+                        ScanKind::Restore => scan_key,
+                    };
                     restorables.insert(
-                        scan_key,
+                        key,
                         ScannedFile {
                             change: match scan_kind {
                                 ScanKind::Backup => ScanChange::Unknown,
@@ -805,16 +966,20 @@ impl GameLayout {
                             hash: v.hash.clone(),
                             ignored: toggled_paths.is_ignored(&self.mapping.name, ignorable_path),
                             redirected,
-                            original_path: Some(original_path),
+                            original_path: Some(original_path.clone()),
                             container: None,
                         },
                     );
                 }
                 BackupFormat::Zip => {
-                    let scan_key = StrictPath::new(self.mapping.game_file_for_zip_immutable(&original_path));
+                    let scan_key = StrictPath::new(mapping_key.replace('\\', "/"));
 
+                    let key = match scan_kind {
+                        ScanKind::Backup => original_path.clone(),
+                        ScanKind::Restore => scan_key,
+                    };
                     restorables.insert(
-                        scan_key,
+                        key,
                         ScannedFile {
                             change: match scan_kind {
                                 ScanKind::Backup => ScanChange::Unknown,
@@ -826,7 +991,7 @@ impl GameLayout {
                             hash: v.hash.clone(),
                             ignored: toggled_paths.is_ignored(&self.mapping.name, ignorable_path),
                             redirected,
-                            original_path: Some(original_path),
+                            original_path: Some(original_path.clone()),
                             container: Some(self.path.joined(&backup.name)),
                         },
                     );
@@ -978,6 +1143,7 @@ impl GameLayout {
         now: &chrono::DateTime<chrono::Utc>,
         format: &BackupFormats,
         retention: Retention,
+        game_install_dirs: &[StrictPath],
     ) -> Option<Backup> {
         if !scan.found_anything_processable() && !retention.force_new_full {
             return None;
@@ -986,9 +1152,9 @@ impl GameLayout {
         let kind = self.plan_backup_kind(retention);
 
         let backup = match kind {
-            BackupKind::Full => Backup::Full(self.plan_full_backup(scan, now, format, retention)),
+            BackupKind::Full => Backup::Full(self.plan_full_backup(scan, now, format, retention, game_install_dirs)),
             BackupKind::Differential => {
-                Backup::Differential(self.plan_differential_backup(scan, now, format, retention))
+                Backup::Differential(self.plan_differential_backup(scan, now, format, retention, game_install_dirs))
             }
         };
 
@@ -1021,6 +1187,7 @@ impl GameLayout {
         now: &chrono::DateTime<chrono::Utc>,
         format: &BackupFormats,
         retention: Retention,
+        game_install_dirs: &[StrictPath],
     ) -> FullBackup {
         let mut files = BTreeMap::new();
         #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
@@ -1029,8 +1196,13 @@ impl GameLayout {
         for (scan_key, file) in scan.found_files.iter().filter(|(_, x)| !x.ignored) {
             match file.change() {
                 ScanChange::New | ScanChange::Different | ScanChange::Same => {
+                    let mapping_key = {
+                        let (category, relative_path) = file.original_path(scan_key).classify_and_split(game_install_dirs);
+                        format!("{}/{}", category.folder_name(), relative_path)
+                    };
+                    
                     files.insert(
-                        file.mapping_key(scan_key),
+                        mapping_key,
                         IndividualMappingFile {
                             hash: file.hash.clone(),
                             size: file.size,
@@ -1067,16 +1239,22 @@ impl GameLayout {
         now: &chrono::DateTime<chrono::Utc>,
         format: &BackupFormats,
         retention: Retention,
+        game_install_dirs: &[StrictPath],
     ) -> DifferentialBackup {
         let mut files = BTreeMap::new();
         #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
         let mut registry = Some(IndividualMappingRegistry::default());
 
         for (scan_key, file) in &scan.found_files {
+            let mapping_key = {
+                let (category, relative_path) = file.original_path(scan_key).classify_and_split(game_install_dirs);
+                format!("{}/{}", category.folder_name(), relative_path)
+            };
+            
             match file.change() {
                 ScanChange::New | ScanChange::Different | ScanChange::Same => {
                     files.insert(
-                        file.mapping_key(scan_key),
+                        mapping_key,
                         (!file.ignored).then(|| IndividualMappingFile {
                             hash: file.hash.clone(),
                             size: file.size,
@@ -1084,7 +1262,7 @@ impl GameLayout {
                     );
                 }
                 ScanChange::Removed => {
-                    files.insert(file.mapping_key(scan_key), None);
+                    files.insert(mapping_key, None);
                 }
                 ScanChange::Unknown => (),
             };
@@ -1133,19 +1311,29 @@ impl GameLayout {
         }
     }
 
-    fn execute_backup_as_simple(&mut self, backup: &Backup, scan: &ScanInfo) -> BackupInfo {
+    fn execute_backup_as_simple(&mut self, backup: &Backup, scan: &ScanInfo, game_install_dirs: &[StrictPath]) -> BackupInfo {
         let mut backup_info = BackupInfo::default();
 
         let mut relevant_files = vec![];
         for (scan_key, file) in &scan.found_files {
-            if !backup.includes_file(file.mapping_key(scan_key)) {
+            let mapping_key = {
+                let (category, relative_path) = file.original_path(scan_key).classify_and_split(game_install_dirs);
+                format!("{}/{}", category.folder_name(), relative_path)
+            };
+            
+            if !backup.includes_file(mapping_key) {
                 log::debug!("[{}] skipped: {}", self.mapping.name, scan_key.raw());
                 continue;
             }
 
-            let target_file = self
-                .mapping
-                .game_file(&self.path, file.effective(scan_key), backup.name());
+            let target_file = {
+                self.mapping.game_file_with_category(
+                    &self.path,
+                    file.effective(scan_key),
+                    backup.name(),
+                    game_install_dirs,
+                )
+            };
             if scan_key.same_content(&target_file) {
                 log::info!(
                     "[{}] already matches: {:?} -> {:?}",
@@ -1187,7 +1375,7 @@ impl GameLayout {
         backup_info
     }
 
-    fn execute_backup_as_zip(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats) -> BackupInfo {
+    fn execute_backup_as_zip(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats, game_install_dirs: &[StrictPath]) -> BackupInfo {
         let mut backup_info = BackupInfo::default();
 
         let fail_file = |file: &StrictPath, backup_info: &mut BackupInfo, error: String| {
@@ -1226,12 +1414,19 @@ impl GameLayout {
             .large_file(true);
 
         'item: for (scan_key, file) in &scan.found_files {
-            if !backup.includes_file(file.mapping_key(scan_key)) {
+            let mapping_key = {
+                let (category, relative_path) = file.original_path(scan_key).classify_and_split(game_install_dirs);
+                format!("{}/{}", category.folder_name(), relative_path)
+            };
+            
+            if !backup.includes_file(mapping_key) {
                 log::debug!("[{}] skipped: {:?}", self.mapping.name, &scan_key);
                 continue;
             }
 
-            let target_file_id = self.mapping.game_file_for_zip(file.effective(scan_key));
+            let target_file_id = {
+                self.mapping.game_file_for_zip_with_category(file.effective(scan_key), game_install_dirs)
+            };
 
             let mtime = match scan_key.get_mtime_zip() {
                 Ok(x) => x,
@@ -1400,13 +1595,13 @@ impl GameLayout {
         }
     }
 
-    fn execute_backup(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats) -> BackupInfo {
+    fn execute_backup(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats, game_install_dirs: &[StrictPath]) -> BackupInfo {
         if backup.only_inherits_and_overrides() {
             BackupInfo::default()
         } else {
             match format.chosen {
-                BackupFormat::Simple => self.execute_backup_as_simple(backup, scan),
-                BackupFormat::Zip => self.execute_backup_as_zip(backup, scan, format),
+                BackupFormat::Simple => self.execute_backup_as_simple(backup, scan, game_install_dirs),
+                BackupFormat::Zip => self.execute_backup_as_zip(backup, scan, format, game_install_dirs),
             }
         }
     }
@@ -1519,6 +1714,7 @@ impl GameLayout {
         format: &BackupFormats,
         retention: Retention,
         only_constructive: bool,
+        game_install_dirs: &[StrictPath],
     ) -> Option<BackupInfo> {
         if !scan.found_anything() {
             log::trace!("[{}] nothing to back up", &scan.game_name);
@@ -1541,7 +1737,7 @@ impl GameLayout {
         }
 
         self.migrate_backups(true);
-        match self.plan_backup(scan, now, format, retention) {
+        match self.plan_backup(scan, now, format, retention, game_install_dirs) {
             None => {
                 log::info!("[{}] no need for new backup", &scan.game_name);
                 None
@@ -1553,7 +1749,7 @@ impl GameLayout {
                     backup.kind(),
                     backup.name()
                 );
-                let backup_info = self.execute_backup(&backup, scan, format);
+                let backup_info = self.execute_backup(&backup, scan, format, game_install_dirs);
                 backup.prune_failures(&backup_info);
                 if backup.needed() {
                     self.insert_backup(backup.clone());
@@ -1589,6 +1785,7 @@ impl GameLayout {
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
         #[cfg_attr(not(target_os = "windows"), allow(unused))] toggled_registry: &ToggledRegistry,
+        game_install_dirs: &[StrictPath],
     ) -> ScanInfo {
         log::trace!("[{name}] beginning scan for restore");
 
@@ -1610,6 +1807,7 @@ impl GameLayout {
                 redirects,
                 reverse_redirects_on_restore,
                 toggled_paths,
+                game_install_dirs,
             );
             available_backups = self.restorable_backups_flattened();
             backup = self.find_by_id_flattened(&id);
@@ -2035,10 +2233,16 @@ impl GameLayout {
             match backup.format() {
                 BackupFormat::Simple => {
                     for file in backup.files.keys() {
-                        let original_path = StrictPath::new(file.to_string());
-                        let stored = self
-                            .mapping
-                            .game_file_immutable(&self.path, &original_path, &backup.name);
+                        // For portable format, the file key is already the path within the backup
+                        // (e.g., "game-relative/Witch.gdb" or "system-user/Documents/saves/game.sav")
+                        let stored = if file.contains('/') {
+                            // Portable format - use the key directly as the relative path
+                            StrictPath::relative(format!("{}/{}", &backup.name, file), self.path.interpret().ok())
+                        } else {
+                            // Legacy format - reconstruct path
+                            let original_path = StrictPath::new(file.to_string());
+                            self.mapping.game_file(&self.path, &original_path, &backup.name)
+                        };
                         if !stored.is_file() {
                             #[cfg(test)]
                             eprintln!("can't find {}", stored.render());
@@ -2055,8 +2259,15 @@ impl GameLayout {
                     };
 
                     for file in backup.files.keys() {
-                        let original_path = StrictPath::new(file.to_string());
-                        let stored = self.mapping.game_file_for_zip_immutable(&original_path);
+                        // For portable format, the file key is already the path within the ZIP
+                        let stored = if file.contains('/') {
+                            // Portable format - use the key directly
+                            file.replace('\\', "/")
+                        } else {
+                            // Legacy format - reconstruct path
+                            let original_path = StrictPath::new(file.to_string());
+                            self.mapping.game_file_for_zip(&original_path)
+                        };
                         if archive.by_name(&stored).is_err() {
                             #[cfg(test)]
                             eprintln!("can't find {stored}");
@@ -2075,10 +2286,15 @@ impl GameLayout {
                                 continue;
                             }
 
-                            let original_path = StrictPath::new(file.to_string());
-                            let stored = self
-                                .mapping
-                                .game_file_immutable(&self.path, &original_path, &backup.name);
+                            // For portable format, the file key is already the path within the backup
+                            let stored = if file.contains('/') {
+                                // Portable format - use the key directly as the relative path
+                                StrictPath::relative(format!("{}/{}", &backup.name, file), self.path.interpret().ok())
+                            } else {
+                                // Legacy format - reconstruct path
+                                let original_path = StrictPath::new(file.to_string());
+                                self.mapping.game_file(&self.path, &original_path, &backup.name)
+                            };
                             if !stored.is_file() {
                                 #[cfg(test)]
                                 eprintln!("can't find {}", stored.render());
@@ -2100,8 +2316,15 @@ impl GameLayout {
                                 continue;
                             }
 
-                            let original_path = StrictPath::new(file.to_string());
-                            let stored = self.mapping.game_file_for_zip_immutable(&original_path);
+                            // For portable format, the file key is already the path within the ZIP
+                            let stored = if file.contains('/') {
+                                // Portable format - use the key directly
+                                file.replace('\\', "/")
+                            } else {
+                                // Legacy format - reconstruct path
+                                let original_path = StrictPath::new(file.to_string());
+                                self.mapping.game_file_for_zip(&original_path)
+                            };
                             if archive.by_name(&stored).is_err() {
                                 #[cfg(test)]
                                 eprintln!("can't find {stored}");
@@ -2223,6 +2446,7 @@ impl BackupLayout {
         reverse_redirects_on_restore: bool,
         toggled_paths: &ToggledPaths,
         only_constructive: bool,
+        game_install_dirs: &[StrictPath],
     ) -> Option<LatestBackup> {
         if self.contains_game(name) {
             let game_layout = self.game_layout(name);
@@ -2232,6 +2456,7 @@ impl BackupLayout {
                 reverse_redirects_on_restore,
                 toggled_paths,
                 only_constructive,
+                game_install_dirs,
             );
             scan.map(|scan| LatestBackup {
                 scan,
@@ -2424,7 +2649,7 @@ mod tests {
             };
             assert_eq!(
                 None,
-                layout.plan_backup(&scan, &now(), &BackupFormats::default(), Retention::default())
+                layout.plan_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[])
             );
         }
 
@@ -2597,7 +2822,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                layout.plan_full_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_full_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2645,7 +2870,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                layout.plan_full_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_full_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2691,7 +2916,7 @@ mod tests {
                     registry: None,
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2749,7 +2974,7 @@ mod tests {
                     registry: None,
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2791,7 +3016,7 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2838,7 +3063,7 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2880,7 +3105,7 @@ mod tests {
                     registry: None,
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -2915,7 +3140,7 @@ mod tests {
                     registry: Some(IndividualMappingRegistry { hash: None }),
                     ..Default::default()
                 },
-                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default()),
+                layout.plan_differential_backup(&scan, &now(), &BackupFormats::default(), Retention::default(), &[]),
             );
         }
 
@@ -3115,6 +3340,7 @@ mod tests {
                 mapping: IndividualMapping {
                     name: "game1".to_string(),
                     drives: drives_x(),
+                    path_mappings: None,
                     backups: VecDeque::from(vec![FullBackup {
                         name: "backup-1".into(),
                         when: past(),
@@ -3147,7 +3373,7 @@ mod tests {
                         redirected: None,
                     },
                 },
-                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default()),
+                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default(), &[]),
             );
         }
 
@@ -3158,6 +3384,7 @@ mod tests {
                 mapping: IndividualMapping {
                     name: "game1".to_string(),
                     drives: drives_x(),
+                    path_mappings: None,
                     backups: VecDeque::from(vec![FullBackup {
                         name: "backup-1.zip".into(),
                         when: past(),
@@ -3190,7 +3417,7 @@ mod tests {
                         redirected: None,
                     },
                 },
-                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default()),
+                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default(), &[]),
             );
         }
 
@@ -3201,6 +3428,7 @@ mod tests {
                 mapping: IndividualMapping {
                     name: "game1".to_string(),
                     drives: drives_x(),
+                    path_mappings: None,
                     backups: VecDeque::from(vec![FullBackup {
                         name: "backup-1".into(),
                         when: past(),
@@ -3253,7 +3481,7 @@ mod tests {
                         redirected: None,
                     },
                 },
-                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default()),
+                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default(), &[]),
             );
         }
 
@@ -3264,6 +3492,7 @@ mod tests {
                 mapping: IndividualMapping {
                     name: "game1".to_string(),
                     drives: drives_x(),
+                    path_mappings: None,
                     backups: VecDeque::from(vec![FullBackup {
                         name: "backup-1.zip".into(),
                         when: past(),
@@ -3316,7 +3545,7 @@ mod tests {
                         redirected: None,
                     },
                 },
-                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default()),
+                layout.restorable_files(&BackupId::Latest, ScanKind::Backup, &[], false, &Default::default(), &[]),
             );
         }
     }
@@ -3354,6 +3583,7 @@ mod tests {
                 IndividualMapping {
                     name: "game1".to_string(),
                     drives: drives_x(),
+                    path_mappings: None,
                     backups: VecDeque::from(vec![FullBackup {
                         name: SOLO.into(),
                         when: now(),
@@ -3417,7 +3647,8 @@ mod tests {
                     &[],
                     false,
                     &Default::default(),
-                    &Default::default()
+                    &Default::default(),
+                    &[],
                 ),
             );
         }
@@ -3477,7 +3708,8 @@ mod tests {
                         &[],
                         false,
                         &Default::default(),
-                        &Default::default()
+                        &Default::default(),
+                        &[],
                     ),
                 );
             } else {
@@ -3512,7 +3744,8 @@ mod tests {
                         &[],
                         false,
                         &Default::default(),
-                        &Default::default()
+                        &Default::default(),
+                        &[],
                     ),
                 );
             }
@@ -3718,6 +3951,7 @@ mod tests {
             let after = IndividualMapping {
                 name: "migrate-legacy-backup".to_string(),
                 drives: drives_x_static(),
+                path_mappings: None,
                 backups: VecDeque::from(vec![FullBackup {
                     name: SOLO.into(),
                     files: btree_map! {
@@ -3748,6 +3982,7 @@ mod tests {
             let before = IndividualMapping {
                 name: "migrate-initial-empty-backup".to_string(),
                 drives: drives_x_static(),
+                path_mappings: None,
                 backups: VecDeque::from(vec![
                     FullBackup {
                         name: SOLO.into(),
@@ -3771,6 +4006,7 @@ mod tests {
             let after = IndividualMapping {
                 name: "migrate-initial-empty-backup".to_string(),
                 drives: drives_x_static(),
+                path_mappings: None,
                 backups: VecDeque::from(vec![FullBackup {
                     name: "backup-20240626T100614Z-diff".into(),
                     when: chrono::DateTime::<chrono::FixedOffset>::parse_from_rfc3339("2024-06-26T10:06:14.120957700Z")
@@ -3808,6 +4044,7 @@ mod tests {
             let before = IndividualMapping {
                 name: "migrate-initial-empty-backup".to_string(),
                 drives: drives_x_static(),
+                path_mappings: None,
                 backups: VecDeque::from(vec![FullBackup {
                     name: SOLO.into(),
                     children: VecDeque::from(vec![DifferentialBackup {
@@ -3829,6 +4066,7 @@ mod tests {
             let after = IndividualMapping {
                 name: "migrate-initial-empty-backup".to_string(),
                 drives: drives_x_static(),
+                path_mappings: None,
                 backups: VecDeque::from(vec![FullBackup {
                     name: "backup-20240626T100614Z-diff".into(),
                     when: chrono::DateTime::<chrono::FixedOffset>::parse_from_rfc3339("2024-06-26T10:06:14.120957700Z")

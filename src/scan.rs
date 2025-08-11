@@ -662,8 +662,16 @@ pub fn scan_game_for_backup(
                 let size = scan_key.size();
                 let hash = scan_key.sha1();
                 let redirected = game_file_target(&scan_key, redirects, reverse_redirects_on_restore, ScanKind::Backup);
+                let lookup_key = redirected.as_ref().unwrap_or(&scan_key);
+                let previous_hash = previous_files.get(lookup_key);
+                if previous_hash.is_none() && !previous_files.is_empty() {
+                    log::trace!("[{name}] No previous hash found for: {}, available keys: {:?}", 
+                        lookup_key.raw(), 
+                        previous_files.keys().take(5).map(|k| k.raw()).collect::<Vec<_>>()
+                    );
+                }
                 let change =
-                    ScanChange::evaluate_backup(&hash, previous_files.get(redirected.as_ref().unwrap_or(&scan_key)));
+                    ScanChange::evaluate_backup(&hash, previous_hash);
                 found_files.insert(
                     scan_key,
                     ScannedFile {
@@ -705,9 +713,17 @@ pub fn scan_game_for_backup(
                         let hash = scan_key.sha1();
                         let redirected =
                             game_file_target(&scan_key, redirects, reverse_redirects_on_restore, ScanKind::Backup);
+                        let lookup_key = redirected.as_ref().unwrap_or(&scan_key);
+                        let previous_hash = previous_files.get(lookup_key);
+                        if previous_hash.is_none() && !previous_files.is_empty() {
+                            log::trace!("[{name}] No previous hash found for: {}, available keys: {:?}", 
+                                lookup_key.raw(), 
+                                previous_files.keys().take(5).map(|k| k.raw()).collect::<Vec<_>>()
+                            );
+                        }
                         let change = ScanChange::evaluate_backup(
                             &hash,
-                            previous_files.get(redirected.as_ref().unwrap_or(&scan_key)),
+                            previous_hash,
                         );
                         found_files.insert(
                             scan_key,

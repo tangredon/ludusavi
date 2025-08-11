@@ -14,6 +14,21 @@ pub enum Drive {
     Windows(String),
 }
 
+/// Path classification for backup structure
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathCategory {
+    /// Path under %USERPROFILE% (e.g. C:\Users\Player\Documents)
+    SystemUser,
+    /// Path under %APPDATA% (Roaming)
+    SystemAppData,
+    /// Path under %LOCALAPPDATA%
+    SystemLocalAppData,
+    /// Path under %LOCALAPPDATA%\Low
+    SystemLocalAppDataLow,
+    /// Path relative to game installation directory
+    GameRelative,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Canonical {
     Valid(String),
@@ -103,6 +118,116 @@ impl CommonPath {
             Self::SavedGames => SAVED_GAMES.as_ref(),
         }
         .map(|x| x.as_str())
+    }
+}
+
+impl PathCategory {
+    pub fn folder_name(&self) -> &'static str {
+        match self {
+            PathCategory::SystemUser => "system-user",
+            PathCategory::SystemAppData => "system-appdata",
+            PathCategory::SystemLocalAppData => "system-localappdata", 
+            PathCategory::SystemLocalAppDataLow => "system-localappdatalow",
+            PathCategory::GameRelative => "game-relative",
+        }
+    }
+
+    pub fn environment_variable(&self) -> &'static str {
+        match self {
+            PathCategory::SystemUser => "%USERPROFILE%",
+            PathCategory::SystemAppData => "%APPDATA%",
+            PathCategory::SystemLocalAppData => "%LOCALAPPDATA%",
+            PathCategory::SystemLocalAppDataLow => "%LOCALAPPDATA%", // Low is subfolder
+            PathCategory::GameRelative => "<GAME_ROOT>",
+        }
+    }
+
+    /// Classify a Windows path based on its location
+    pub fn classify_windows_path(path: &StrictPath, game_install_dirs: &[StrictPath]) -> Self {
+        let path_str = path.raw().replace('\\', "/"); // Normalize separators
+        
+        // Get the known folder paths and normalize them
+        let userprofile = CommonPath::Home.get().unwrap_or("").replace('\\', "/");
+        let appdata = CommonPath::Data.get().unwrap_or("").replace('\\', "/");
+        let localappdata = CommonPath::DataLocal.get().unwrap_or("").replace('\\', "/");
+        let localappdata_low = CommonPath::DataLocalLow.get().unwrap_or("").replace('\\', "/");
+        
+        // Debug logging
+        log::debug!("Classifying path: '{}'", path_str);
+        log::debug!("  userprofile: '{}'", userprofile);
+        log::debug!("  appdata: '{}'", appdata);
+        log::debug!("  localappdata: '{}'", localappdata);
+        
+        // Check system paths first (more specific to less specific)
+        if !localappdata_low.is_empty() && path_str.to_lowercase().starts_with(&localappdata_low.to_lowercase()) {
+            log::debug!("  -> SystemLocalAppDataLow");
+            return PathCategory::SystemLocalAppDataLow;
+        }
+        if !localappdata.is_empty() && path_str.to_lowercase().starts_with(&localappdata.to_lowercase()) {
+            log::debug!("  -> SystemLocalAppData");
+            return PathCategory::SystemLocalAppData;
+        }
+        if !appdata.is_empty() && path_str.to_lowercase().starts_with(&appdata.to_lowercase()) {
+            log::debug!("  -> SystemAppData");
+            return PathCategory::SystemAppData;
+        }
+        
+        // Check for user profile paths (direct match)
+        if !userprofile.is_empty() && path_str.to_lowercase().starts_with(&userprofile.to_lowercase()) {
+            log::debug!("  -> SystemUser (direct)");
+            return PathCategory::SystemUser;
+        }
+        
+        // Handle common Windows user folder patterns
+        // Pattern: C:/Users/{username}/{Documents|Desktop|Pictures|etc.}
+        if let Some(users_pos) = path_str.to_lowercase().find("/users/") {
+            if let Some(slash_pos) = path_str[users_pos + 7..].find('/') {
+                let username_end = users_pos + 7 + slash_pos;
+                let after_username = &path_str[username_end..];
+                
+                // Check if this is under standard user folders
+                let user_folders = [
+                    "/documents/", "/desktop/", "/pictures/", "/videos/", 
+                    "/music/", "/downloads/", "/onedrive/", "/appdata/"
+                ];
+                
+                for folder in &user_folders {
+                    if after_username.to_lowercase().starts_with(folder) {
+                        // Special handling for AppData within user folder
+                        if *folder == "/appdata/" {
+                            if after_username.to_lowercase().starts_with("/appdata/roaming/") {
+                                log::debug!("  -> SystemAppData (user pattern)");
+                                return PathCategory::SystemAppData;
+                            } else if after_username.to_lowercase().starts_with("/appdata/local/") {
+                                if after_username.to_lowercase().starts_with("/appdata/local/low/") {
+                                    log::debug!("  -> SystemLocalAppDataLow (user pattern)");
+                                    return PathCategory::SystemLocalAppDataLow;
+                                } else {
+                                    log::debug!("  -> SystemLocalAppData (user pattern)");
+                                    return PathCategory::SystemLocalAppData;
+                                }
+                            }
+                        } else {
+                            log::debug!("  -> SystemUser (user pattern: {})", folder);
+                            return PathCategory::SystemUser;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check if path is under any game installation directory
+        for game_dir in game_install_dirs {
+            let game_dir_normalized = game_dir.raw().replace('\\', "/");
+            if path_str.to_lowercase().starts_with(&game_dir_normalized.to_lowercase()) {
+                log::debug!("  -> GameRelative");
+                return PathCategory::GameRelative;
+            }
+        }
+        
+        // Fallback to game-relative path
+        log::debug!("  -> GameRelative (fallback)");
+        PathCategory::GameRelative
     }
 }
 
@@ -920,6 +1045,135 @@ impl StrictPath {
                 log::error!("Unreachable state: unable to split drive of path: {}", &self.raw);
                 unreachable!()
             }
+        }
+    }
+
+    /// Classifies Windows path and returns relative portion for backup
+    pub fn classify_and_split(&self, game_install_dirs: &[StrictPath]) -> (PathCategory, String) {
+        // Use Windows path classification for backup structure
+        let category = PathCategory::classify_windows_path(self, game_install_dirs);
+        let relative_path = self.get_relative_path_for_category(&category, game_install_dirs);
+        
+        // Debug logging to help identify classification issues
+        log::debug!("Path classification: '{}' -> {:?} -> '{}'", self.raw(), category, relative_path);
+        
+        (category, relative_path)
+    }
+    
+    /// Get the relative path portion for a given category
+    fn get_relative_path_for_category(&self, category: &PathCategory, game_install_dirs: &[StrictPath]) -> String {
+        let path_str = self.raw().replace('\\', "/"); // Normalize separators
+        
+        match category {
+            PathCategory::SystemUser => {
+                // Try multiple approaches for user profile paths
+                let userprofile = CommonPath::Home.get().unwrap_or("").replace('\\', "/");
+                
+                // Direct match with user profile
+                if !userprofile.is_empty() && path_str.to_lowercase().starts_with(&userprofile.to_lowercase()) {
+                    let relative = &path_str[userprofile.len()..];
+                    return relative.trim_start_matches('/').to_string();
+                }
+                
+                // Handle Windows user folder patterns: C:/Users/{username}/...
+                if let Some(users_pos) = path_str.to_lowercase().find("/users/") {
+                    if let Some(slash_pos) = path_str[users_pos + 7..].find('/') {
+                        let username_end = users_pos + 7 + slash_pos;
+                        let after_username = &path_str[username_end + 1..]; // Skip the slash
+                        
+                        // Handle OneDrive-redirected Documents
+                        if after_username.to_lowercase().starts_with("onedrive/documents/") {
+                            // Convert "onedrive/documents/..." to "documents/..."
+                            return format!("Documents/{}", &after_username["onedrive/documents/".len()..]);
+                        }
+                        // Handle direct user folders
+                        else if after_username.to_lowercase().starts_with("onedrive/") {
+                            // For other OneDrive folders, keep the OneDrive prefix
+                            return after_username.to_string();
+                        }
+                        // Handle standard user folders (Documents, Desktop, etc.)
+                        else if after_username.to_lowercase().starts_with("documents/") ||
+                                after_username.to_lowercase().starts_with("desktop/") ||
+                                after_username.to_lowercase().starts_with("pictures/") ||
+                                after_username.to_lowercase().starts_with("videos/") ||
+                                after_username.to_lowercase().starts_with("music/") ||
+                                after_username.to_lowercase().starts_with("downloads/") {
+                            return after_username.to_string();
+                        }
+                    }
+                }
+                
+                // Fallback: return full path if we can't make it relative
+                log::warn!("Could not make SystemUser path relative: {}", path_str);
+                path_str
+            },
+            PathCategory::SystemAppData => {
+                let appdata = CommonPath::Data.get().unwrap_or("").replace('\\', "/");
+                
+                // Direct match with AppData Roaming
+                if !appdata.is_empty() && path_str.to_lowercase().starts_with(&appdata.to_lowercase()) {
+                    let relative = &path_str[appdata.len()..];
+                    return relative.trim_start_matches('/').to_string();
+                }
+                
+                // Handle user pattern: C:/Users/{username}/AppData/Roaming/...
+                if let Some(roaming_pos) = path_str.to_lowercase().find("/appdata/roaming/") {
+                    let after_roaming = &path_str[roaming_pos + "/appdata/roaming/".len()..];
+                    return after_roaming.to_string();
+                }
+                
+                log::warn!("Could not make SystemAppData path relative: {}", path_str);
+                path_str
+            },
+            PathCategory::SystemLocalAppData => {
+                let localappdata = CommonPath::DataLocal.get().unwrap_or("").replace('\\', "/");
+                if !localappdata.is_empty() && path_str.to_lowercase().starts_with(&localappdata.to_lowercase()) {
+                    let relative = &path_str[localappdata.len()..];
+                    return relative.trim_start_matches('/').to_string();
+                }
+                path_str
+            },
+            PathCategory::SystemLocalAppDataLow => {
+                let localappdata_low = CommonPath::DataLocalLow.get().unwrap_or("").replace('\\', "/");
+                if !localappdata_low.is_empty() && path_str.to_lowercase().starts_with(&localappdata_low.to_lowercase()) {
+                    let relative = &path_str[localappdata_low.len()..];
+                    let clean_relative = relative.trim_start_matches('/');
+                    return clean_relative.to_string();
+                }
+                path_str
+            },
+            PathCategory::GameRelative => {
+                // Find the matching game directory and get relative path
+                for game_dir in game_install_dirs {
+                    let game_dir_normalized = game_dir.raw().replace('\\', "/");
+                    if path_str.to_lowercase().starts_with(&game_dir_normalized.to_lowercase()) {
+                        let relative = &path_str[game_dir_normalized.len()..];
+                        return relative.trim_start_matches('/').to_string();
+                    }
+                }
+                
+                // If no exact match, try to make it relative by removing drive and common path segments
+                let (_, path_without_drive) = self.split_drive();
+                let path_without_drive = path_without_drive.replace('\\', "/");
+                
+                // Try to find a common game directory name in the path
+                for game_dir in game_install_dirs {
+                    let game_dir_name = game_dir.raw()
+                        .replace('\\', "/")
+                        .split('/')
+                        .last()
+                        .unwrap_or("")
+                        .to_lowercase();
+                        
+                    if let Some(game_name_pos) = path_without_drive.to_lowercase().find(&game_dir_name) {
+                        let relative = &path_without_drive[game_name_pos + game_dir_name.len()..];
+                        return relative.trim_start_matches('/').to_string();
+                    }
+                }
+                
+                // Final fallback: just use path without drive
+                path_without_drive
+            },
         }
     }
 

@@ -117,6 +117,24 @@ pub struct App {
     jump_to_game_after_scan: Option<String>,
 }
 
+/// Extract game install directories from launcher information
+fn extract_game_install_dirs(launchers: &crate::scan::Launchers, roots: &[Root], game_name: &str) -> Vec<StrictPath> {
+    let mut install_dirs = Vec::new();
+    
+    for root in roots {
+        for launcher_game in launchers.get_game(root, game_name) {
+            if let Some(install_dir) = &launcher_game.install_dir {
+                if !install_dirs.contains(install_dir) {
+                    install_dirs.push(install_dir.clone());
+                }
+            }
+        }
+    }
+    
+    install_dirs
+}
+
+
 impl App {
     fn go_idle(&mut self) {
         if self.exiting {
@@ -504,6 +522,7 @@ impl App {
                                     return (None, None);
                                 }
 
+                                let game_install_dirs = extract_game_install_dirs(&launchers, &roots, &key);
                                 let previous = layout.latest_backup(
                                     &key,
                                     SCAN_KIND,
@@ -511,6 +530,7 @@ impl App {
                                     config.restore.reverse_redirects,
                                     &config.restore.toggled_paths,
                                     config.backup.only_constructive,
+                                    &game_install_dirs,
                                 );
 
                                 if filter.excludes(games_specified, previous.is_some(), &game.cloud) {
@@ -545,6 +565,7 @@ impl App {
                                         &config.backup.format,
                                         retention,
                                         config.backup.only_constructive,
+                                        &extract_game_install_dirs(&launchers, &roots, &key),
                                     )
                                 } else {
                                     None
@@ -799,6 +820,8 @@ impl App {
             }
             RestorePhase::Load => {
                 let restore_path = self.config.restore.path.clone();
+                let config = self.config.clone();
+                let mut cache = self.cache.clone();
 
                 self.progress.start();
 
@@ -806,16 +829,24 @@ impl App {
                     async move {
                         let layout = BackupLayout::new(restore_path);
                         let restorables = layout.restorable_games();
-                        (layout, restorables)
+                        
+                        // Load manifest and scan for launchers
+                        let manifest = crate::cli::load_manifest(&config, &mut cache, true, false).unwrap_or_default();
+                        let title_finder = crate::scan::TitleFinder::new(&config, &manifest, layout.restorable_game_set());
+                        let roots = config.expanded_roots();
+                        let launchers = crate::scan::launchers::Launchers::scan(&roots, &manifest, &restorables, &title_finder, None);
+                        
+                        (layout, restorables, launchers)
                     },
-                    move |(layout, restorables)| {
-                        Message::Restore(RestorePhase::RegisterCommands { layout, restorables })
+                    move |(layout, restorables, launchers)| {
+                        Message::Restore(RestorePhase::RegisterCommands { layout, restorables, launchers })
                     },
                 )
             }
             RestorePhase::RegisterCommands {
                 mut restorables,
                 layout,
+                launchers,
             } => {
                 log::info!("beginning restore with {} steps", restorables.len());
                 let preview = self.operation.preview();
@@ -857,10 +888,14 @@ impl App {
 
                 let config = std::sync::Arc::new(self.config.clone());
                 let layout = std::sync::Arc::new(layout);
+                let launchers = std::sync::Arc::new(launchers);
+                let roots = std::sync::Arc::new(self.config.expanded_roots());
 
                 for name in restorables {
                     let config = config.clone();
                     let layout = layout.clone();
+                    let launchers = launchers.clone();
+                    let roots = roots.clone();
                     let cancel_flag = self.operation_should_cancel.clone();
                     let backup_id = self.backups_to_restore.get(&name).cloned().unwrap_or(BackupId::Latest);
                     self.operation_steps.push(OperationStep {
@@ -873,6 +908,7 @@ impl App {
                                     return (None, None, layout);
                                 }
 
+                                let game_install_dirs = crate::scan::extract_game_install_dirs(&launchers, &roots, &name);
                                 let scan_info = layout.scan_for_restoration(
                                     &name,
                                     &backup_id,
@@ -880,6 +916,7 @@ impl App {
                                     config.restore.reverse_redirects,
                                     &config.restore.toggled_paths,
                                     &config.restore.toggled_registry,
+                                    &game_install_dirs,
                                 );
                                 if !config.is_game_enabled_for_restore(&name) && !single {
                                     return (Some(scan_info), None, layout);

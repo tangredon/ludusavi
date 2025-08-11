@@ -7,8 +7,8 @@ use crate::{
     prelude::{app_dir, Error},
     report,
     scan::{
-        layout::BackupLayout, prepare_backup_target, scan_game_for_backup, BackupId, DuplicateDetector, Launchers,
-        OperationStepDecision, ScanKind, SteamShortcuts, TitleFinder, TitleMatch,
+        extract_game_install_dirs, layout::BackupLayout, prepare_backup_target, scan_game_for_backup, BackupId,
+        DuplicateDetector, Launchers, OperationStepDecision, ScanKind, SteamShortcuts, TitleFinder, TitleMatch,
     },
 };
 
@@ -194,6 +194,7 @@ impl Ludusavi {
             log::trace!("step {i} / {}: {name}", games.len());
             let game = &self.manifest.0[name];
 
+            let game_install_dirs = extract_game_install_dirs(&launchers, &roots, name);
             let previous = self.layout.latest_backup(
                 name,
                 ScanKind::Backup,
@@ -201,6 +202,7 @@ impl Ludusavi {
                 self.config.restore.reverse_redirects,
                 &self.config.restore.toggled_paths,
                 self.config.backup.only_constructive,
+                &game_install_dirs,
             );
 
             if self
@@ -247,6 +249,7 @@ impl Ludusavi {
                     &self.config.backup.format,
                     retention,
                     self.config.backup.only_constructive,
+                    &game_install_dirs,
                 )
             };
             log::trace!("step {i} completed");
@@ -327,6 +330,8 @@ impl Ludusavi {
         let games = evaluate_games(self.manifest.primary_titles(), games, &self.title_finder)?;
 
         let mut duplicate_detector = DuplicateDetector::default();
+        let roots = self.config.expanded_roots();
+        let launchers = Launchers::scan(&roots, &self.manifest, &games, &self.title_finder, None);
 
         let cloud_sync = self.config.cloud.synchronize
             && !finality.preview()
@@ -366,6 +371,7 @@ impl Ludusavi {
         let step = |i, name| {
             log::trace!("step {i} / {}: {name}", games.len());
             let mut layout = self.layout.game_layout(name);
+            let game_install_dirs = extract_game_install_dirs(&launchers, &roots, name);
             let scan_info = layout.scan_for_restoration(
                 name,
                 backup_id.as_ref().unwrap_or(&BackupId::Latest),
@@ -373,6 +379,7 @@ impl Ludusavi {
                 self.config.restore.reverse_redirects,
                 &self.config.restore.toggled_paths,
                 &self.config.restore.toggled_registry,
+                &game_install_dirs,
             );
             let ignored = !&self.config.is_game_enabled_for_restore(name) && !games_specified && !include_disabled;
             let decision = if ignored {

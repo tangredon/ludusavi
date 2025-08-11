@@ -22,8 +22,8 @@ use crate::{
     report::{self, report_cloud_changes, Reporter},
     resource::{cache::Cache, config::Config, manifest::Manifest, ResourceFile, SaveableResourceFile},
     scan::{
-        layout::BackupLayout, prepare_backup_target, scan_game_for_backup, BackupId, DuplicateDetector, Launchers,
-        OperationStepDecision, ScanKind, SteamShortcuts, TitleFinder, TitleQuery,
+        extract_game_install_dirs, layout::BackupLayout, prepare_backup_target, scan_game_for_backup, BackupId,
+        DuplicateDetector, Launchers, OperationStepDecision, ScanKind, SteamShortcuts, TitleFinder, TitleQuery,
     },
     wrap,
 };
@@ -50,7 +50,7 @@ fn negatable_flag(on: bool, off: bool, default: bool) -> bool {
     }
 }
 
-fn load_manifest(
+pub fn load_manifest(
     config: &Config,
     cache: &mut Cache,
     no_manifest_update: bool,
@@ -286,6 +286,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                 log::trace!("step {i} / {}: {name}", games.len());
                 let game = &manifest.0[name];
 
+                let game_install_dirs = extract_game_install_dirs(&launchers, &roots, name);
                 let previous = layout.latest_backup(
                     name,
                     ScanKind::Backup,
@@ -293,6 +294,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     config.restore.reverse_redirects,
                     &config.restore.toggled_paths,
                     config.backup.only_constructive,
+                    &game_install_dirs,
                 );
 
                 if filter.excludes(games_specified, previous.is_some(), &game.cloud) {
@@ -358,6 +360,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                             &backup_format(),
                             retention,
                             config.backup.only_constructive,
+                            &game_install_dirs,
                         ),
                         Ok(false) | Err(_) => None,
                     }
@@ -368,6 +371,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                         &backup_format(),
                         retention,
                         config.backup.only_constructive,
+                        &game_install_dirs,
                     )
                 };
                 log::trace!("step {i} completed");
@@ -500,6 +504,8 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
 
             let manifest = load_manifest(&config, &mut cache, true, false).unwrap_or_default();
             let title_finder = TitleFinder::new(&config, &manifest, layout.restorable_game_set());
+            let roots = config.expanded_roots();
+            let launchers = Launchers::scan(&roots, &manifest, &games, &title_finder, None);
 
             let games_specified = !games.is_empty();
             let games = match evaluate_games(layout.restorable_game_set(), games, &title_finder) {
@@ -565,6 +571,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
             let step = |i, name| {
                 log::trace!("step {i} / {}: {name}", games.len());
                 let mut layout = layout.game_layout(name);
+                let game_install_dirs = extract_game_install_dirs(&launchers, &roots, name);
                 let scan_info = layout.scan_for_restoration(
                     name,
                     backup_id.as_ref().unwrap_or(&BackupId::Latest),
@@ -572,6 +579,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     config.restore.reverse_redirects,
                     &config.restore.toggled_paths,
                     &config.restore.toggled_registry,
+                    &game_install_dirs,
                 );
                 let ignored = !&config.is_game_enabled_for_restore(name) && !games_specified && !include_disabled;
                 let decision = if ignored {
